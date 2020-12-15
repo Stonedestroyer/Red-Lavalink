@@ -1,10 +1,12 @@
 import asyncio
+import datetime
 from random import shuffle
 from typing import Optional, TYPE_CHECKING
 
 import discord
+from discord.backoff import ExponentialBackoff
 
-from . import log
+from . import log, ws_rll_log
 from .enums import *
 from .rest_api import RESTClient, Track
 
@@ -23,7 +25,7 @@ class Player(RESTClient):
     It also is used to control playback and queue tracks.
 
     The existence of this object guarantees that the bot is connected
-    to a voice voice channel.
+    to a voice channel.
 
     Attributes
     ----------
@@ -48,18 +50,28 @@ class Player(RESTClient):
         self.repeat = False
         self.shuffle = False  # Shuffle is done client side now This is a breaking change
         self.shuffle_bumped = True
-
+        self._is_autoplaying = False
+        self._auto_play_sent = False
         self._volume = 100
 
         self._is_playing = False
         self._metadata = {}
         self.manager = manager
+        self._con_delay = None
+        self._last_resume = None
 
     def __repr__(self):
         return (
             f'<Player: guild="{self.channel.guild.name}" channel="{self.channel.name}",'
             f" playing={self.is_playing} paused={self.paused} volume={self.volume}>"
         )
+
+    @property
+    def is_auto_playing(self) -> bool:
+        """
+        Current status of playback
+        """
+        return self._is_playing and not self._paused and self._is_autoplaying
 
     @property
     def is_playing(self) -> bool:
@@ -87,7 +99,7 @@ class Player(RESTClient):
         """
         Whether the underlying node is ready for requests.
         """
-        return self.node.ready.is_set()
+        return self.node.ready
 
     async def wait_until_ready(
         self, timeout: Optional[float] = None, no_raise: bool = False
@@ -98,7 +110,7 @@ class Player(RESTClient):
         If no_raise is set, returns false when a timeout occurs instead of propogating TimeoutError.
         A timeout of None means to wait indefinitely.
         """
-        if self.node.ready.is_set():
+        if self.node.ready:
             return True
 
         try:
@@ -109,13 +121,18 @@ class Player(RESTClient):
             else:
                 raise
 
-    async def connect(self):
+    async def connect(self, deafen: bool = False, channel: Optional[discord.VoiceChannel] = None):
         """
         Connects to the voice channel associated with this Player.
         """
-        await self.node.join_voice_channel(self.channel.guild.id, self.channel.id)
+        self._last_resume = datetime.datetime.now(tz=datetime.timezone.utc)
+        if channel:
+            self.channel = channel
+        await self.channel.guild.change_voice_state(
+            channel=self.channel, self_mute=False, self_deaf=deafen
+        )
 
-    async def move_to(self, channel: discord.VoiceChannel):
+    async def move_to(self, channel: discord.VoiceChannel, deafen: bool = False):
         """
         Moves this player to a voice channel.
 
@@ -127,12 +144,14 @@ class Player(RESTClient):
             raise TypeError("Cannot move to a different guild.")
 
         self.channel = channel
-        await self.connect()
+        await self.connect(deafen=deafen)
 
     async def disconnect(self, requested=True):
         """
         Disconnects this player from it's voice channel.
         """
+        self._is_autoplaying = False
+        self._auto_play_sent = False
         if self.state == PlayerState.DISCONNECTING:
             return
 
@@ -147,7 +166,7 @@ class Player(RESTClient):
         voice_ws = self.node.get_voice_ws(guild_id)
 
         if not voice_ws.socket.closed:
-            await voice_ws.voice_state(guild_id, None)
+            await self.channel.guild.change_voice_state(channel=None)
 
         await self.node.destroy_guild(guild_id)
         await self.close()
@@ -177,13 +196,15 @@ class Player(RESTClient):
         if state == self.state:
             return
 
-        log.debug(
-            f"player for guild {self.channel.guild.id} changing state:"
-            f" {self.state.name} -> {state.name}"
+        ws_rll_log.debug(
+            f"Player for guild {self.channel.guild.id} changing state: {self.state.name} -> {state.name}"
         )
 
         old_state = self.state
         self.state = state
+
+        if self._con_delay:
+            self._con_delay = None
 
         if state == PlayerState.READY:
             self.reset_session()
@@ -208,6 +229,11 @@ class Player(RESTClient):
                 await self.play()
             else:
                 self._is_playing = False
+        elif event == LavalinkEvents.WEBSOCKET_CLOSED:
+            code = extra.get("code")
+            if code in (4015, 4014, 4009, 4006, 1006):
+                if not self._con_delay:
+                    self._con_delay = ExponentialBackoff(base=1)
 
     async def handle_player_update(self, state: "node.PlayerState"):
         """
@@ -217,6 +243,14 @@ class Player(RESTClient):
         ----------
         state : websocket.PlayerState
         """
+
+        if (
+            self.channel
+            and self._is_playing
+            and self.channel.guild.me.id not in {i.id for i in self.channel.members if i.bot}
+        ):
+            self._is_playing = False
+            return
         if state.position > self.position:
             self._is_playing = True
         self.position = state.position
@@ -281,9 +315,15 @@ class Player(RESTClient):
 
             self.current = track
             log.debug("Assigned current.")
-            await self.node.play(self.channel.guild.id, track)
-            if track.start_timestamp > 0:
-                await self.seek(track.start_timestamp)
+            await self.node.play(
+                self.channel.guild.id, track, start=track.start_timestamp, replace=True
+            )
+
+    async def resume(self, track: Track, replace: bool = True, start: int = 0):
+        self._paused = False
+        self._is_playing = True
+        log.debug("Resuming current.")
+        await self.node.play(self.channel.guild.id, track, start=start, replace=replace)
 
     async def stop(self):
         """
@@ -298,6 +338,8 @@ class Player(RESTClient):
         self.current = None
         self.position = 0
         self._paused = False
+        self._is_autoplaying = False
+        self._auto_play_sent = False
 
     async def skip(self):
         """
@@ -359,7 +401,7 @@ class PlayerManager:
     def guild_ids(self):
         return self._player_dict.keys()
 
-    async def create_player(self, channel: discord.VoiceChannel) -> Player:
+    async def create_player(self, channel: discord.VoiceChannel, deafen: bool = False) -> Player:
         """
         Connects to a discord voice channel.
 
@@ -377,10 +419,10 @@ class PlayerManager:
         """
         if self._already_in_guild(channel):
             p = self.get_player(channel.guild.id)
-            await p.move_to(channel)
+            await p.move_to(channel, deafen=deafen)
         else:
             p = Player(self, channel)
-            await p.connect()
+            await p.connect(deafen=deafen)
             self._player_dict[channel.guild.id] = p
             await self.refresh_player_state(p)
         return p
@@ -432,7 +474,7 @@ class PlayerManager:
             await p.disconnect(requested=False)
 
     async def node_state_handler(self, next_state: NodeState, old_state: NodeState):
-        log.debug(f"Received node state update: {old_state.name} -> {next_state.name}")
+        ws_rll_log.debug(f"Received node state update: {old_state.name} -> {next_state.name}")
         if next_state == NodeState.READY:
             await self.update_player_states(PlayerState.READY)
         elif next_state == NodeState.DISCONNECTING:
@@ -445,7 +487,7 @@ class PlayerManager:
             await p.update_state(state)
 
     async def refresh_player_state(self, player: Player):
-        if self.node.state == NodeState.READY:
+        if self.node.ready:
             await player.update_state(PlayerState.READY)
         elif self.node.state == NodeState.DISCONNECTING:
             await player.update_state(PlayerState.DISCONNECTING)
@@ -466,7 +508,6 @@ class PlayerManager:
         if event == DiscordVoiceSocketResponses.VOICE_SERVER_UPDATE:
             # Connected for the first time
             socket_event_data = data["d"]
-
             self.voice_states[guild_id].update({"guild_id": guild_id, "event": socket_event_data})
         elif event == DiscordVoiceSocketResponses.VOICE_STATE_UPDATE:
             channel_id = data["d"]["channel_id"]
@@ -477,7 +518,7 @@ class PlayerManager:
 
             if channel_id is None:
                 # We disconnected
-                log.debug("Received voice disconnect from discord, removing player.")
+                ws_rll_log.info("Received voice disconnect from discord, removing player.")
                 self.voice_states[guild_id] = {}
                 await self._remove_player(int(guild_id))
 

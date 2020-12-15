@@ -32,7 +32,6 @@ async def initialize(
     bot: Bot,
     host,
     password,
-    rest_port,
     ws_port,
     timeout=30,
     resume_key: Optional[str] = None,
@@ -54,8 +53,6 @@ async def initialize(
         The hostname or IP address of the Lavalink node.
     password : str
         The password of the Lavalink node.
-    rest_port : int
-        The port of the REST API on the Lavalink node.
     ws_port : int
         The websocket port on the Lavalink Node.
     timeout : int
@@ -80,7 +77,6 @@ async def initialize(
         host,
         password,
         port=ws_port,
-        rest=rest_port,
         user_id=player_manager.user_id,
         num_shards=bot.shard_count if bot.shard_count is not None else 1,
         resume_key=resume_key,
@@ -88,6 +84,7 @@ async def initialize(
     )
 
     await lavalink_node.connect(timeout=timeout)
+    lavalink_node._retries = 0
 
     bot.add_listener(node.on_socket_response)
     bot.add_listener(_on_guild_remove, name="on_guild_remove")
@@ -95,7 +92,7 @@ async def initialize(
     return lavalink_node
 
 
-async def connect(channel: discord.VoiceChannel):
+async def connect(channel: discord.VoiceChannel, deafen: bool = False):
     """
     Connects to a discord voice channel.
 
@@ -117,7 +114,7 @@ async def connect(channel: discord.VoiceChannel):
         If there are no available lavalink nodes ready to connect to discord.
     """
     node_ = node.get_node(channel.guild.id)
-    p = await node_.player_manager.create_player(channel)
+    p = await node_.player_manager.create_player(channel, deafen=deafen)
     return p
 
 
